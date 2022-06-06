@@ -1,4 +1,6 @@
+import logging
 import os
+from pathlib import Path
 
 import numpy as np
 import rasterio
@@ -121,6 +123,7 @@ class RasterTiler(object):
         nodata=None,
         alpha=None,
         force_load_cog=False,
+        resize=None,
         resampling=None,
         tile_bounds=None,
         verbose=False,
@@ -128,11 +131,14 @@ class RasterTiler(object):
         # set up attributes
         if verbose:
             print("Initializing Tiler...")
-        self.dest_dir = dest_dir
-        if not os.path.exists(self.dest_dir):
-            os.makedirs(self.dest_dir)
+        try:
+            self.dest_dir = Path(dest_dir)
+            self.dest_dir.mkdir(exist_ok=True, parents=True)
+        except TypeError as e:
+            logging.critical(f'Tiling destination directory cannot be created: {self.dest_dir}')
+            raise e
         if dest_crs is not None:
-            self.dest_crs = _check_crs(dest_crs)
+            self.dest_crs = _check_crs(dest_crs, return_rasterio=True)
         else:
             self.dest_crs = None
         self.src_tile_size = src_tile_size
@@ -141,6 +147,7 @@ class RasterTiler(object):
             self.dest_tile_size = src_tile_size
         else:
             self.dest_tile_size = dest_tile_size
+        self.resize = resize
         self.resampling = resampling
         self.force_load_cog = force_load_cog
         self.nodata = nodata
@@ -180,7 +187,7 @@ class RasterTiler(object):
 
         Arguments
         ---------
-        src : :class:`rasterio.io.DatasetReader` or str
+        src : :class:`rasterio.io.DatasetReader`, :class:`Path` or str
             The source dataset to tile.
         nodata_threshold : float, optional
             Nodata percentages greater than this threshold will not be saved as tiles.
@@ -274,10 +281,14 @@ class RasterTiler(object):
         if os.path.exists(restricted_im_path):
             os.remove(restricted_im_path)
         if self.verbose:
-            print("Done. CRS returned for vector tiling.")
-        return _check_crs(
-            profile["crs"]
-        )  # returns the crs to be used for vector tiling
+            print(f"Done. CRS returned for vector tiling: {profile['crs']}")
+        raster_crs = _check_crs(profile['crs'], return_rasterio=True)
+        if raster_crs.is_epsg_code:
+            return raster_crs  # returns the crs to be used for vector tiling
+        else:
+            logging.error("Raster's CRS is not an EPSG code and cannot be used to validate CRS match "
+                          "with ground truth's CRS. The tiling process will assume CRS match.")
+            return None
 
     def tile_generator(
         self,
@@ -396,8 +407,11 @@ class RasterTiler(object):
 
         if getattr(self, "tile_bounds", None) is None:
             self.get_tile_bounds()
+            if self.verbose:
+                logging.info(f'Will create {len(self.tile_bounds)} tiles\n')
+            logging.debug(f'Tile bounds:\n{self.tile_bounds}')
 
-        for tb in self.tile_bounds:
+        for tb in tqdm(self.tile_bounds):
             # removing the following line until COG functionality implemented
             if True:  # not self.is_cog or self.force_load_cog:
                 window = rasterio.windows.from_bounds(
@@ -430,7 +444,7 @@ class RasterTiler(object):
                     dst_width=self.dest_tile_size[1]
                 )
 
-                if self.dest_crs != self.src_crs and self.resampling_method is not None:
+                if self.dest_crs != self.src_crs and self.resampling is not None:
                     tile_data = np.zeros(
                         shape=(src_data.shape[0], height, width), dtype=src_data.dtype
                     )
@@ -445,7 +459,7 @@ class RasterTiler(object):
                         resampling=getattr(Resampling, self.resampling),
                     )
 
-                elif self.dest_crs != self.src_crs and self.resampling_method is None:
+                elif self.dest_crs != self.src_crs and self.resampling is None:
                     print(
                         "Warning: You've set resampling to None but your "
                         "destination projection differs from the source "
@@ -469,7 +483,6 @@ class RasterTiler(object):
                     )
 
                 else:  # for the case where there is no resampling and no dest_crs specified, no need to reproject or resample
-
                     tile_data = src_data
 
                 if self.nodata:
@@ -494,11 +507,17 @@ class RasterTiler(object):
                 height=self.dest_tile_size[0],
                 crs=self.dest_crs,
                 transform=dst_transform,
+                compress='lzw'
             )
             if len(tile_data.shape) == 2:  # if there's no channel band
                 profile.update(count=1)
             else:
                 profile.update(count=tile_data.shape[0])
+
+            if not tile_data.any():
+                logging.error(f'Tile contains no non-zero values\n'
+                                f'Tile bounds: {tb}\n'
+                                f'Tile bounds area: {box(*tb).area}')
 
             yield tile_data, mask, profile, tb
 
@@ -523,7 +542,7 @@ class RasterTiler(object):
         # if self.cog_output:
         #     dest_path = os.path.join(self.dest_dir, 'tmp.tif')
         # else:
-        dest_path = os.path.join(self.dest_dir, dest_fname)
+        dest_path = self.dest_dir / dest_fname
 
         with rasterio.open(dest_path, "w", **profile) as dest:
             if profile["count"] == 1:
