@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
@@ -31,9 +32,8 @@ class VectorTiler(object):
     ):
         if verbose or super_verbose:
             print("Preparing the tiler...")
-        self.dest_dir = dest_dir
-        if not os.path.isdir(self.dest_dir):
-            os.makedirs(self.dest_dir)
+        self.dest_dir = Path(dest_dir)
+        self.dest_dir.mkdir(exist_ok=True)
         if dest_crs is not None:
             self.dest_crs = _check_crs(dest_crs)
         self.output_format = output_format
@@ -59,7 +59,7 @@ class VectorTiler(object):
 
         Arguments
         ---------
-        src : `str` or :class:`geopandas.GeoDataFrame`
+        src : `str`, :class:`geopandas.GeoDataFrame` or :class:`Path`
             The source vector data to tile. Must either be a path to a GeoJSON
             or a :class:`geopandas.GeoDataFrame`.
         tile_bounds : list
@@ -114,24 +114,14 @@ class VectorTiler(object):
             obj_id_col=obj_id_col,
         )
         self.tile_paths = []
-        for tile_gdf, tb in tqdm(tile_gen):
+        self.tile_bds_reprojtd = []
+        for tile_gdf, tb, tb_geom_reproj in tqdm(tile_gen):
+            self.tile_bds_reprojtd.append(tb_geom_reproj)
             if self.proj_unit not in ["meter", "metre"]:
-                dest_path = os.path.join(
-                    self.dest_dir,
-                    "{}_{}_{}{}".format(
-                        dest_fname_base,
-                        np.round(tb[0], 3),
-                        np.round(tb[3], 3),
-                        output_ext,
-                    ),
-                )
+                dest_path = self.dest_dir / f'{dest_fname_base}_{np.round(tb[0], 3)}_{np.round(tb[3], 3)}{output_ext}'
             else:
-                dest_path = os.path.join(
-                    self.dest_dir,
-                    "{}_{}_{}{}".format(
-                        dest_fname_base, int(tb[0]), int(tb[3]), output_ext
-                    ),
-                )
+                dest_path = self.dest_dir / f'{dest_fname_base}_{int(tb[0])}_{int(tb[3])}{output_ext}'
+
             self.tile_paths.append(dest_path)
             if len(tile_gdf) > 0:
                 tile_gdf.to_file(dest_path, driver="GeoJSON")
@@ -221,6 +211,7 @@ class VectorTiler(object):
                     verbose=self.super_verbose,
                 )
             else:
+                tb_geom_reproj = box(*tb)
                 tile_gdf = clip_gdf(
                     self.src,
                     tb,
@@ -232,7 +223,7 @@ class VectorTiler(object):
                 tile_gdf = tile_gdf.to_crs(crs=self.dest_crs.to_wkt())
             if split_multi_geoms:
                 split_multi_geometries(tile_gdf, obj_id_col=obj_id_col)
-            yield tile_gdf, tb
+            yield tile_gdf, tb, tb_geom_reproj
 
 
 def search_gdf_polygon(gdf, tile_polygon):
@@ -359,9 +350,9 @@ def clip_gdf(
         cut_gdf["truncated"] = 0
         # cut_gdf = cut_gdf[cut_gdf.geom_type != "GeometryCollection"]
         if len(cut_gdf) > 0 and verbose:
-            print("clip_gdf() - gdf.iloc[0]:", gdf.iloc[0])
-            print("clip_gdf() - tb:", tb)
-            print("clip_gdf() - gdf_cut:", cut_gdf)
+            logging.info("clip_gdf() - gdf.iloc[0]:", gdf.iloc[0])
+            logging.info("clip_gdf() - tb:", tb)
+            logging.info("clip_gdf() - gdf_cut:", cut_gdf)
 
     # TODO: IMPLEMENT TRUNCATION MEASUREMENT FOR LINESTRINGS
 
